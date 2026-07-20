@@ -1,0 +1,76 @@
+{
+	"geode": "5.7.1",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081",
+		"mac": "2.2081",
+		"ios": "2.2081"
+	},
+	"id": "obsidianmode2.camera-culling",
+	"name": "Out of Sight",
+	"version": "v0.0.1",
+	"developer": "ObsidianMode2",
+	"description": "Adds camera culling to the game. Renders only the objects in camera sight to boost performance.",
+	"tags": [ "gameplay", "performance", "customization" ],
+	"dependencies": {
+		"geode.node-ids": ">=v1.23.3"
+	},
+	"links": {
+		"source": "https://github.com/ObsidianDark/Out-of-Sight"
+	},
+	"settings": {
+		"title-general": {
+			"type": "title",
+			"name": "General Options"
+		},
+		"enable-culling": {
+			"type": "bool",
+			"name": "Enable Camera Culling",
+			"description": "Toggles object culling on or off during gameplay.",
+			"default": true
+		},
+		"culling-margin": {
+			"type": "float",
+			"name": "Culling Margin",
+			"description": "Additional pixel boundary padding outside the camera view before objects are culled.",
+			"default": 150.0,
+			"min": -300.0,
+			"max": 500.0,
+			"control": {
+				"arrows": true
+			}
+		},
+		"debug-culling": {
+			"type": "bool",
+			"name": "Debug Draw Culling Bounds",
+			"description": "Draws a red rectangle showing the current culling boundary, plus tints culled objects' bounding boxes.",
+			"default": false
+		},
+		"ignore-triggers": {
+			"type": "bool",
+			"name": "Ignore Triggers",
+			"description": "Prevents triggers and special internal objects from being hidden when out of bounds.",
+			"default": true
+		},
+		"enable-lod": {
+			"type": "bool",
+			"default": false,
+			"name": "Enable LOD"
+		},
+		"lod-threshold": {
+			"type": "float",
+			"default": 0.5,
+			"name": "LOD Scale Threshold (fraction of normal size)"
+		},
+		"lod-hysteresis": {
+			"type": "float",
+			"default": 0.15,
+			"name": "LOD Hysteresis"
+		},
+		"cell-size": {
+			"type": "float",
+			"default": 500.0,
+			"name": "Culling Cell Size (px)"
+		}
+	}
+}
