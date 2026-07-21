@@ -1,6 +1,7 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/binding/GameObject.hpp>
+#include <Geode/loader/SettingV3.hpp>
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -18,6 +19,75 @@ static inline int64_t cellKey(int cx, int cy) {
     return (static_cast<int64_t>(cx) << 32) ^ static_cast<uint32_t>(cy);
 }
 
+// --------------------------------------------------------------------------
+// Cached settings. Settings are global (not per-GameLayer), so they live here
+// rather than in Fields. listenForSettingChanges only fires on a *change* --
+// it does not fire on startup -- so every value here must also be seeded once
+// with getSettingValue in $on_mod(Loaded) below. Everything runs on the main
+// thread (settings UI callbacks and processCommands both do), so plain
+// fields are fine here; no atomics/locking needed.
+// --------------------------------------------------------------------------
+namespace {
+    struct CullingSettings {
+        bool enableCulling = true;
+        bool debugCulling = false;
+        bool ignoreTriggers = false;
+        bool enableLod = false;
+        float cellSize = 300.f;
+        float margin = 0.f;
+        float lodThreshold = 0.5f;
+        float lodHysteresis = 0.15f;
+    };
+
+    CullingSettings g_settings;
+
+    // Same UB-guard the original getCellSize() had, kept in one place now.
+    float sanitizeCellSize(double raw) {
+        float v = static_cast<float>(raw);
+        return v <= 0.f ? 300.f : v;
+    }
+}
+
+$on_mod(Loaded) {
+    auto mod = Mod::get();
+
+    // Seed initial values -- listenForSettingChanges will NOT call these on
+    // startup, only on subsequent edits, so this step isn't optional.
+    g_settings.enableCulling = mod->getSettingValue<bool>("enable-culling");
+    g_settings.debugCulling = mod->getSettingValue<bool>("debug-culling");
+    g_settings.ignoreTriggers = mod->getSettingValue<bool>("ignore-triggers");
+    g_settings.enableLod = mod->getSettingValue<bool>("enable-lod");
+    g_settings.cellSize = sanitizeCellSize(mod->getSettingValue<double>("cell-size"));
+    g_settings.margin = static_cast<float>(mod->getSettingValue<double>("culling-margin"));
+    g_settings.lodThreshold = static_cast<float>(mod->getSettingValue<double>("lod-threshold"));
+    g_settings.lodHysteresis = static_cast<float>(mod->getSettingValue<double>("lod-hysteresis"));
+
+    listenForSettingChanges<bool>("enable-culling", [](bool v) {
+        g_settings.enableCulling = v;
+        });
+    listenForSettingChanges<bool>("debug-culling", [](bool v) {
+        g_settings.debugCulling = v;
+        });
+    listenForSettingChanges<bool>("ignore-triggers", [](bool v) {
+        g_settings.ignoreTriggers = v;
+        });
+    listenForSettingChanges<bool>("enable-lod", [](bool v) {
+        g_settings.enableLod = v;
+        });
+    listenForSettingChanges<double>("cell-size", [](double v) {
+        g_settings.cellSize = sanitizeCellSize(v);
+        });
+    listenForSettingChanges<double>("culling-margin", [](double v) {
+        g_settings.margin = static_cast<float>(v);
+        });
+    listenForSettingChanges<double>("lod-threshold", [](double v) {
+        g_settings.lodThreshold = static_cast<float>(v);
+        });
+    listenForSettingChanges<double>("lod-hysteresis", [](double v) {
+        g_settings.lodHysteresis = static_cast<float>(v);
+        });
+}
+
 class $modify(CullingGameLayer, GJBaseGameLayer) {
 public:
     struct Fields {
@@ -27,50 +97,73 @@ public:
         CCRect cameraBounds;             // cached so the per-tick LOD pass doesn't need cameraMoved
         bool built = false;
         float builtCellSize = -1.f;      // cell size the grid was actually built with -- detects setting changes
-        int builtObjectCount = -1;       // m_objects->count() at last build -- detects newly streamed-in objects
+        int builtObjectCount = -1;       // m_objects->count() at last build/append -- detects newly streamed-in objects
         CCPoint lastCameraPos = CCPoint(NAN, NAN);
         float lastScale = -1.f;
         CCDrawNode* debugNode = nullptr; // lazily created, lives on m_objectLayer
     };
 
-    // Reads the tunable cell size from settings each call rather than baking
-    // it in as a constexpr. Smaller = more precise culling but more buckets
-    // to check per frame; larger = fewer buckets but more objects per bucket.
-    float getCellSize() {
-        float size = static_cast<float>(Mod::get()->getSettingValue<double>("cell-size"));
-        // Guard against zero/negative values from a misconfigured setting --
-        // dividing positions by this later would otherwise be undefined/UB-adjacent.
-        if (size <= 0.f) size = 300.f;
-        return size;
+    // Buckets a single object into the grid. Shared by buildGrid() (full
+    // rebuild) and addObjectsToGrid() (incremental append) so the two paths
+    // can't drift out of sync with each other.
+    void bucketObject(GameObject * obj, float cellSize, bool ignoreTriggers) {
+        if (!obj) return;
+        if (ignoreTriggers && obj->m_isTrigger) return; // never touch these
+
+        CCRect r = obj->boundingBox();
+        float halfW = r.size.width * 0.5f;
+        float halfH = r.size.height * 0.5f;
+        CCPoint p = obj->getPosition();
+
+        int cx = static_cast<int>(std::floor(p.x / cellSize));
+        int cy = static_cast<int>(std::floor(p.y / cellSize));
+        m_fields->grid[cellKey(cx, cy)].push_back({ obj, halfW, halfH, false });
     }
 
+    // Full rebuild: clears everything and re-buckets every object. Only
+    // needed on first run or when cell-size actually changes (rare -- a user
+    // moving a slider), since that changes which bucket every object belongs
+    // in.
     void buildGrid() {
         auto& grid = m_fields->grid;
         grid.clear();
-        if (!m_objects) return;
-
-        bool ignoreTriggers = Mod::get()->getSettingValue<bool>("ignore-triggers");
-        float cellSize = getCellSize();
-
-        for (int i = 0; i < m_objects->count(); ++i) {
-            auto obj = static_cast<GameObject*>(m_objects->objectAtIndex(i));
-            if (!obj) continue;
-            if (ignoreTriggers && obj->m_isTrigger) continue; // never touch these
-
-            CCRect r = obj->boundingBox();
-            float halfW = r.size.width * 0.5f;
-            float halfH = r.size.height * 0.5f;
-            CCPoint p = obj->getPosition();
-
-            int cx = static_cast<int>(std::floor(p.x / cellSize));
-            int cy = static_cast<int>(std::floor(p.y / cellSize));
-            grid[cellKey(cx, cy)].push_back({ obj, halfW, halfH, false });
-        }
         m_fields->prevKeys.clear();
         m_fields->activeKeys.clear();
+        if (!m_objects) return;
+
+        float cellSize = g_settings.cellSize;
+        bool ignoreTriggers = g_settings.ignoreTriggers;
+
+        for (int i = 0; i < m_objects->count(); ++i) {
+            bucketObject(static_cast<GameObject*>(m_objects->objectAtIndex(i)), cellSize, ignoreTriggers);
+        }
+
         m_fields->built = true;
-        m_fields->builtCellSize = cellSize;       // remember what size this grid was keyed with
-        m_fields->builtObjectCount = m_objects->count(); // remember how many objects existed at this build
+        m_fields->builtCellSize = cellSize;
+        m_fields->builtObjectCount = m_objects->count();
+    }
+
+    // Incremental append: GD streams objects into m_objects progressively as
+    // the player approaches them, so objectCount climbs steadily through a
+    // level. Existing objects are already correctly bucketed for the current
+    // cell size, so there's no need to re-touch them -- just bucket the new
+    // tail. This assumes m_objects only grows by append (GD's normal
+    // streaming behavior) and that indices already seen never get reordered
+    // or removed out from under us; if some other mod mutates m_objects
+    // that way, this would silently miss/duplicate entries, hence the sanity
+    // check below rather than assuming it blindly.
+    void addObjectsToGrid(int fromIndex) {
+        if (!m_objects) return;
+        int count = m_objects->count();
+        if (count <= fromIndex) return; // nothing new, or count went backwards unexpectedly
+
+        float cellSize = g_settings.cellSize;
+        bool ignoreTriggers = g_settings.ignoreTriggers;
+
+        for (int i = fromIndex; i < count; ++i) {
+            bucketObject(static_cast<GameObject*>(m_objects->objectAtIndex(i)), cellSize, ignoreTriggers);
+        }
+        m_fields->builtObjectCount = count;
     }
 
     // Draws the current culling rectangle, in m_objectLayer's local coordinate
@@ -125,11 +218,10 @@ public:
     // trigger/small-group scaling reads as scale < 1.0 here regardless of
     // where the camera is, which is the "smaller than usual" signal we want.
     void updateLod() {
-        bool lodEnabled = Mod::get()->getSettingValue<bool>("enable-lod");
-        if (!lodEnabled || !m_fields->built) return;
+        if (!g_settings.enableLod || !m_fields->built) return;
 
-        float lodThreshold = static_cast<float>(Mod::get()->getSettingValue<double>("lod-threshold")); // fraction of normal scale, e.g. 0.5
-        float lodHysteresis = static_cast<float>(Mod::get()->getSettingValue<double>("lod-hysteresis")); // e.g. 0.15 = 15%
+        float lodThreshold = g_settings.lodThreshold; // fraction of normal scale, e.g. 0.5
+        float lodHysteresis = g_settings.lodHysteresis; // e.g. 0.15 = 15%
         float offThreshold = lodThreshold * (1.f + lodHysteresis);
         float onThreshold = lodThreshold * (1.f - lodHysteresis);
 
@@ -158,29 +250,29 @@ public:
             }
         }
     }
-
+    
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         if (!isLastTick) return;
 
-        bool enabled = Mod::get()->getSettingValue<bool>("enable-culling");
-        bool debugCulling = Mod::get()->getSettingValue<bool>("debug-culling");
-        if (!enabled) {
+        if (!g_settings.enableCulling) {
             updateDebugDraw(0, 0, 0, 0, false); // hide overlay if culling is off
             return;
         }
         if (!m_objectLayer || !m_objects) return;
 
-        // Rebuild if never built, the cell-size setting changed, OR the game
-        // has streamed in more objects since the last build (GD loads level
-        // sections progressively, so m_objects grows over time -- anything
-        // added after our last build was never bucketed and would otherwise
-        // sit at default visibility forever, which is why background objects
-        // farther into the level weren't getting culled).
-        float cellSize = getCellSize();
+        // Rebuild only if never built or the cell-size setting actually
+        // changed (changes every object's bucket). Otherwise, if GD has
+        // streamed in more objects since the last build/append, just bucket
+        // the new tail -- cheap, and avoids re-touching objects that are
+        // already correctly bucketed.
+        float cellSize = g_settings.cellSize;
         int objectCount = m_objects->count();
-        if (!m_fields->built || m_fields->builtCellSize != cellSize || m_fields->builtObjectCount != objectCount) {
+        if (!m_fields->built || m_fields->builtCellSize != cellSize) {
             buildGrid();
+        }
+        else if (objectCount > m_fields->builtObjectCount) {
+            addObjectsToGrid(m_fields->builtObjectCount);
         }
 
         // Cheap heuristic for the "camera hasn't moved" early-out below. This
@@ -189,6 +281,7 @@ public:
         CCPoint rawPos = m_objectLayer->getPosition();
         float rawScale = m_objectLayer->getScale();
 
+        bool debugCulling = g_settings.debugCulling;
         bool cameraMoved = !(rawPos.equals(m_fields->lastCameraPos) && rawScale == m_fields->lastScale);
         if (!cameraMoved && !debugCulling) {
             updateLod(); // object scale can change every tick, independent of the camera
@@ -197,7 +290,7 @@ public:
         m_fields->lastCameraPos = rawPos;
         m_fields->lastScale = rawScale;
 
-        float margin = static_cast<float>(Mod::get()->getSettingValue<double>("culling-margin"));
+        float margin = g_settings.margin;
         CCSize winSize = CCDirector::sharedDirector()->getWinSize();
 
         // Convert the two screen corners into m_objectLayer's local space via
