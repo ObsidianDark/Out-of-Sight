@@ -8,7 +8,7 @@
 	},
 	"id": "obsidianmode2.camera-culling",
 	"name": "Out of Sight",
-	"version": "v0.0.2",
+	"version": "0.0.2",
 	"developer": "ObsidianMode2",
 	"description": "Adds camera culling to the game. Renders only the objects in camera sight to boost performance.",
 	"tags": [ "gameplay", "performance", "customization" ],
