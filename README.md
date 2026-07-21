@@ -1,4 +1,7 @@
-# Out of Sight
+<h1>
+  <img src="logo.png" alt="Out of Sight Logo" width="100" align="center">
+  Out of Sight
+</h1>
 
 A Geode mod for Geometry Dash that hides off-screen level objects and reduces
 the visual detail of objects that are scaled down, to help with performance
